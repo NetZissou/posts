@@ -120,14 +120,47 @@ Each executor has a **Block Manager** that:
 
 So when a reduce task needs data for a specific shuffle partition, it queries the **Driver** to get the location(s) of the shuffle files for that partition. It then fetches the shuffle data directly from the corresponding executors.
 
+Note that the partitioning and shuffling happened to both `combined_df` and `lookup_tbl`. 
 
 ## Step 3: Joining
 
-Note that the partitioning and shuffling happened to both `combined_df` and `lookup_tbl`. 
+Finally, each partition of the join key from `combined_df` is co-located with the corresponding partition of the same key `lookup_tbl`. It is time to join the shuffle partitions together. 
 
-Finally, each partition of the join key from `combined_df` is co-located with the corresponding partition of the same key `lookup_tbl`. 
 
-On each executor, the partitions from `combined_df` and `lookup_tbl` with the same join key are joined using the specified join condition (inner join in this case). A nested-loop, sort-merge, or hash join algorithm is used, depending on the nature of the data. We won't be going to the details here on the join operation.
+### Different Join Strategies
+
+Spark supports multiple join types, each suited for specific scenarios based on dataset size, data distribution, and memory constraints. Here’s a breakdown of join types: 
+
+
+| **Join Type**           | **Description**                                                                                  | **When to Use**                                                                                       |
+| ----------------------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| **Broadcast Hash Join** | Broadcasts the smaller dataset to all executors and uses a hash table for joining.               | When one dataset is small enough to fit in executor memory (e.g., < 10MB-100MB depending on cluster). |
+| **Shuffle Hash Join**   | Both datasets are shuffled and partitioned by join key. A hash table is built for one partition. | When datasets are moderately large, and memory is sufficient to hold one partition in memory.         |
+| **Sort-Merge Join**     | Sorts both datasets on the join key and merges them in sorted order.                             | When both datasets are large, and there’s insufficient memory for hash joins.                         |
+| **Cartesian Join**      | Performs a cross-product of the two datasets (all combinations).                                 | When no join condition is specified (should be avoided unless explicitly required).                   |
+| **Skew Join**           | Handles skewed join keys by redistributing skewed keys more evenly across partitions.            | When datasets are large and skewed (used in conjunction with AQE or salting).                         |
+
+When no explicit join type is specified, Spark uses Sort-Merge Join. This is because it’s robust and works well for large datasets without requiring one dataset to fit in memory. However, if broadcast join conditions are met (e.g., one dataset is smaller than the `spark.sql.autoBroadcastJoinThreshold`), Spark uses Broadcast Hash Join. 
+
+We won't into details on how each join strategy is implemented. You can learn more about the implementations at this [Introduction to Database Systems](https://www.youtube.com/watch?v=1qZeNZvEgGg&list=PLzzVuDSjP25RQb_VhEBFWFiB7oS9APM7h) course offered by UC Berkeley. Here's a general guide for you to select a join method based on the dataset size:
+
+|**Dataset A Size**|**Dataset B Size**|**Recommended Join**|**Reason**|
+|---|---|---|---|
+|Small|Small|**Broadcast Hash Join**|No shuffle required; small datasets are broadcast to all nodes.|
+|Small|Large|**Broadcast Hash Join**|Broadcast the small dataset to avoid shuffling the large dataset.|
+|Moderate|Moderate|**Shuffle Hash Join** or **Sort-Merge Join**|Depends on memory availability. Use Shuffle Hash Join if memory is sufficient.|
+|Large|Large|**Sort-Merge Join**|Handles large datasets efficiently by sorting and merging.|
+|Large + Skewed|Any|**Skew Join**|Redistributes skewed keys to balance partition sizes and avoid task stragglers.|
+
+### Adaptive Query Execution (AQE) 
+
+Tired of manual tuning? Adaptive Query Execution (AQE) is a feature in Spark that dynamically adjusts query plans at runtime based on the actual data. It has been enabled by default since Spark `3.2.0`. For joins, AQE can:
+
+- Dynamically select efficient join strategies
+- Handle data skew to balance the workflow, preventing out-of-memory errors
+- Dynamically coalesce shuffle partitions
+
+To explore more how AQE can enhance performance tuning, you can refer to Spark's [official documentation](https://spark.apache.org/docs/3.5.3/sql-performance-tuning.html#adaptive-query-execution) for detailed information.
 
 ## Why are shuffle joins expensive?
 
@@ -161,14 +194,3 @@ In this example we joined `combined_df` and `lookup_tbl` on the key `uuid`. The 
 
 The executors doing the reduce must read all corresponding shuffle files for their partition, which can stress memory if the partition is large. Insufficient memory can lead to costly spills to disk or even job failures.
 
-## Concerns & Improvements
-
-Hash Join vs Sort-Merge Join
-
-Data Skew Mitigation
-- Salting Keys
-- Adaptive Query Execution (AQE)
-
-Avoiding Shuffle Joins, Bucketing
-
-Consistent Partitioning Strategies
